@@ -1,0 +1,43 @@
+{
+    "Version": "2012-10-17",
+    "Id": "PolicyForDestinationBucket",
+    "Statement": [
+        {
+            "Sid": "Permissions on objects",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "*"
+            },
+            "Action": [
+                "s3:ReplicateDelete",
+                "s3:ReplicateObject",
+                "s3:ReplicateTags",
+                "s3:ObjectOwnerOverrideToBucketOwner"
+            ],
+            "Resource": "arn:aws:s3:::xxxxxxxxxx-us-east-1-s3serveraccesslog/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalOrgID": "o-abcefghi"
+                }
+            }
+        },
+        {
+            "Sid": "Permissions on bucket",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "*"
+            },
+            "Action": [
+                "s3:List*",
+                "s3:GetBucketVersioning",
+                "s3:PutBucketVersioning"
+            ],
+            "Resource": "arn:aws:s3:::xxxxxxxxx-us-east-1-s3serveraccesslog",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalOrgID": "o-abcefghi"
+                }
+            }
+        }
+    ]
+}
