@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This template will deploy an AWS Config rule to automatically remediate S3 Access Logs enablement'
+Parameters:
+  ConfigRemediationRole:
+    Description: Name of the Role that is used for running the SSM document as remediator.
+    Type: String
+    Default: SSMAutomationS3AccessLogsEnablerDoNotREMOVE
+  IAMReplicationRole:
+    Description: Name of the Role that is used for replicating S3 buckets.
+    Type: String
+    Default: S3ReplicationRoleDoNotREMOVE
+  CustomConfigRuleName:
+    Description: Name that you want to give to the AWS Config Rule.
+    Type: String
+    Default: ConfigRuleForS3AccessLogsTagging
+  tag1Key:
+    Type: String
+    Default: S3_Access_logs
+    Description: The Key for the S3 buckets enabled with access logs.
+  tag1Value:
+    Type: String
+    Default: Enabled
+    Description: The Value for the S3 buckets enabled with access logs.
+  MaxExecutionFrequency:
+    Type: String
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+    Description: The maximum frequency with which AWS Config runs evaluations for a rule.
+    Default: One_Hour
+  CentralBucketARN:
+    Default: arn:aws:s3:::xxxxxxxx-us-east-1-s3serveraccesslog
+    Description: ARN of the S3 bucket in the Central Logging account to send S3 Access Logs.
+    Type: String
+  CentralLogAccount:
+    Description: The Central Log Archive account number.
+    Type: String
+    Default: "xxxxxxxxx"
+  BucketObjectExpiryDays:
+    Description: The number of days the log objects will be retained in the regional log buckets.
+    Type: Number
+    Default: "5"
+  LogDestinationBucketPrefix:
+    Description: The Prefix used for the Log destination buckets in the respective region in Member account
+    Type: String
+    Default: "s3-accesslog"
+
+Resources:
+  SSMDocumentAWSEnableS3AccessLogs:
+    Type: AWS::SSM::Document
+    Properties: 
+      Content:
+        description: Custom  SSM Document for AWS-EnableS3AccessLogs
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          AutomationAssumeRole:
+            default: ''
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+            type: String
+            allowedPattern: '^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@_\/-]+|^$'
+          IAMReplicationRole:
+            default: ''
+            description: (Required) The ARN for the IAM role in the Member account that permits S3 to publish logs to Log Archive Account.
+            type: String
+            allowedPattern: '^(arn:aws(-cn|-us-gov)?:.*\S.*)|^$'
+          CentralLogAccount:
+            default: ''
+            description: (Required) The Log Archive Central account number.
+            type: String
+          CentralBucketARN:
+            default: ''
+            description: (Required) The Central Bucket(Log Archive Account) where logs will be published to.
+            type: String
+            allowedPattern: '^(arn:aws(-cn|-us-gov)?:.*\S.*)'
+          S3Ids:
+            description: (Required) A comma separated list of the S3 Bucket Name.
+            type: StringList
+          tag1Key:
+            default: 'S3_Access_logs'
+            description: (Required) The Key of the Tag that will be added to the Bucket
+            type: String
+          tag1Value:
+            default: 'Enabled'
+            description: (Required) The Value of the Tag that will be added to the Bucket
+            type: String
+          BucketObjectExpiryDays:
+            default: 5
+            description: (Required) The number of days the log objects will be retained in the regional log buckets.
+            type: Integer
+          LogDestinationBucketPrefix:
+            default: 's3-accesslog'
+            description: (Required) The Prefix used for the Log destination buckets in the respective region in Member account
+            type: String
+
+        mainSteps:
+          - inputs:
+              Script: |
+                import boto3
+                import logging
+                import json
+                sts = boto3.client('sts')
+                s3 = boto3.client('s3')
+                s3_resource = boto3.resource('s3')
+                logger = logging.getLogger()
+                logger.setLevel(logging.INFO)
+
+                # Variables 
+                AccountNumber = sts.get_caller_identity()["Account"]
+
+                # Create Destination bucket if not existing
+                def create_log_destination_bucket(log_destination_bucket,bucket_region,IAMReplicationRole,CentralBucketARN,CentralLogAccount,BucketObjectExpiryDays,tag1Key,tag1Value):
+                    
+                    having_bucket = True
+                    try:
+                        s3_resource.meta.client.head_bucket(Bucket=log_destination_bucket)
+                    except:
+                        having_bucket = False
+                    if not having_bucket:
+                        # Creating bucket in the specific region
+                        print("|| Log Destination Bucket doesn't exist; Creating new")
+                        if bucket_region == 'us-east-1':
+                            s3_us_east_1 = boto3.client('s3', region_name='us-east-1')
+                            s3_us_east_1.create_bucket(Bucket=log_destination_bucket)
+                        else:
+                            s3.create_bucket(Bucket=log_destination_bucket,CreateBucketConfiguration={ 'LocationConstraint': bucket_region })
+                        print("|| Bucket " + log_destination_bucket + " created successfully")
+
+                        # Setting Destination bucket policy to have S3 logging service to write to bucket
+                        set_log_destination_bucket_policy(log_destination_bucket,AccountNumber)
+
+                        # Setting Destination bucket lifecycle rule
+                        set_log_destination_bucket_expiration_rule(log_destination_bucket,BucketObjectExpiryDays)
+
+                        # Enabling Log Replication to Central Bucket
+                        set_log_destination_bucket_replication(log_destination_bucket,CentralLogAccount,CentralBucketARN,IAMReplicationRole)
+                                
+                    else:
+                        print("|| Log Destination Bucket exists. Using Bucket : " + log_destination_bucket)
+                    
+                    # Tagging the destination bucket to avoid looping
+                    bucket_tagging(log_destination_bucket,tag1Key,tag1Value)
+
+                # Set Destination bucket policy
+                def set_log_destination_bucket_policy(log_destination_bucket,AccountNumber):
+                    print("|| Setting Log Destination Bucket policy ")
+                    destination_resource=("arn:aws:s3:::" + log_destination_bucket + "/*")
+                    target_bucket_policy = {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Sid": "S3ServerAccessLogsPolicy",
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "Service": "logging.s3.amazonaws.com"
+                                },
+                                "Action": "s3:PutObject",
+                                "Resource": destination_resource,
+                                "Condition": {
+                                    "StringEquals": {
+                                        "aws:SourceAccount": AccountNumber
+                                    }
+                                }
+                            }]
+                        }
+                    policy_string=json.dumps(target_bucket_policy)
+                    
+                    bucket_policy = s3.put_bucket_policy( Bucket=log_destination_bucket, Policy=policy_string)
+
+                # Set Destination bucket Versioning and lifecycle rule to expire object in specific days
+                def set_log_destination_bucket_expiration_rule(log_destination_bucket,BucketObjectExpiryDays):
+                    print("|| Enabling Log Destination Bucket versioning")
+                    versioning = s3.put_bucket_versioning(Bucket=log_destination_bucket,VersioningConfiguration={'Status':'Enabled'})
+                    print("|| Setting Log Destination Bucket expiry rule")
+                    lifecycle_rule = {
+                        'Expiration': { 'Days': BucketObjectExpiryDays },
+                        'Filter': { 'Prefix': '' },
+                        'Status': 'Enabled',
+                        'ID': 'BucketExpiryRule',
+                        'NoncurrentVersionExpiration': { 'NoncurrentDays': BucketObjectExpiryDays, 'NewerNoncurrentVersions': BucketObjectExpiryDays }
+                    }
+                    set_lifecycle_configuration = s3.put_bucket_lifecycle_configuration(
+                        Bucket=log_destination_bucket,
+                        LifecycleConfiguration={ 'Rules': [ lifecycle_rule ] }
+                    )
+                    # Disabling Public Access for the Log Destination bucket
+                    print("|| Setting Log Destination Bucket Public access block")
+                    make_bucket_private = s3.put_public_access_block(
+                        Bucket=log_destination_bucket,
+                        PublicAccessBlockConfiguration={
+                            'BlockPublicAcls': True,
+                            'IgnorePublicAcls': True,
+                            'BlockPublicPolicy': True,
+                            'RestrictPublicBuckets': True
+                        },
+                    )
+
+                # Enable Log Destination bucket replication to Central Log Archive Account
+                def set_log_destination_bucket_replication(log_destination_bucket,CentralLogAccount,CentralBucketARN,IAMReplicationRole):
+                    print("|| Enabling Log Replication to central bucket")
+                    replication_rule = {
+                        "ID": "BucketReplicationRule",
+                        "Priority": 1,
+                        "Filter": {"Prefix": ""},
+                        'Destination': { 'Bucket': CentralBucketARN,  'Account': CentralLogAccount, 'AccessControlTranslation': {'Owner':'Destination'}},
+                        'Status': 'Enabled',
+                        'DeleteMarkerReplication': {'Status': 'Disabled'}
+                    } 
+                    set_repication_policy = s3.put_bucket_replication(
+                        Bucket=log_destination_bucket,
+                        ReplicationConfiguration={ 'Role': IAMReplicationRole,  'Rules': [ replication_rule ]
+                }
+                    )
+
+                # Tagging the bucket
+                def bucket_tagging(s3id,tag1Key,tag1Value):
+                    print("|| Enabling Bucket Tag " + tag1Key + " for Bucket " + s3id )
+                    new_bucket_tag = {'Key': tag1Key, 'Value': tag1Value}
+                    having_bucket_tags = True
+                    try:
+                        s3_resource.BucketTagging(s3id).tag_set
+                    except:
+                        having_bucket_tags = False
+                    if not having_bucket_tags:
+                        print ("|| Bucket has no existing Tags; Creating new tag")
+                        bucket_tags = [new_bucket_tag]
+                    else:
+                        print ("|| Bucket has existing Tags; Appending new tag")
+                        bucket_tags = s3_resource.BucketTagging(s3id).tag_set
+                        append_tag = "True"
+                        for tag in range(0, len(bucket_tags)):
+                            if tag1Key in str(bucket_tags[tag]):
+                                print ("|| Bucket has the tag " + tag1Key + " . Updating the tag.")
+                                bucket_tags[tag] = new_bucket_tag
+                                append_tag="False"
+                        if append_tag == "True":
+                            bucket_tags.append(new_bucket_tag)
+                    tag_creation = s3.put_bucket_tagging(Bucket=s3id, Tagging={ 'TagSet': bucket_tags})
+
+                # Find S3 Bucket Region
+                def find_bucket_region(s3id):
+                    s3region=s3.get_bucket_location(Bucket=s3id)["LocationConstraint"]
+                    if s3region is None:
+                        bucket_region = "us-east-1"
+                    else:
+                        bucket_region = s3region
+                    return bucket_region
+
+                # Enable Bucket Logging
+                def enable_bucket_logging(s3id,log_destination_bucket,bucket_region):
+                    print("|| Activating server access logging for S3 Bucket " +  s3id )
+                    if s3id == log_destination_bucket:
+                        print("|| Log Destination and Source cannot be same (Loop). Ignoring ")
+                    else:
+                        create_s3_log = s3.put_bucket_logging(
+                            Bucket=s3id,
+                            BucketLoggingStatus={
+                                'LoggingEnabled': {
+                                    'TargetBucket': log_destination_bucket,
+                                    'TargetPrefix': bucket_region + "/" + AccountNumber + "/" + s3id
+                                }
+                            }
+                        )
+
+                # Main function
+                def lambda_handler(event, context):
+                    S3Ids = event['S3Ids']
+                    IAMReplicationRole = event['IAMReplicationRole']
+                    CentralBucketARN = event['CentralBucketARN']
+                    CentralLogAccount = event['CentralLogAccount']
+                    BucketObjectExpiryDays = event['BucketObjectExpiryDays']
+                    LogDestinationBucketPrefix  = event['LogDestinationBucketPrefix']
+                    tag1Key = event['tag1Key']
+                    tag1Value = event['tag1Value']
+                    for s3id in S3Ids:
+                        try:
+                            print("|| Bucket identified for enabling logging: " + s3id)
+
+                            # Checking if bucket logging is enabled ; If not enabled, enable s3 access logging
+                            s3temp = s3.get_bucket_logging(Bucket=s3id)
+
+                            # Finding bucket Region
+                            bucket_region=find_bucket_region(s3id)
+                            print("|| Bucket region : " + bucket_region)
+                            
+                            # Finding appropriate Log Destination bucket
+                            log_destination_bucket = LogDestinationBucketPrefix + "-" + AccountNumber + "-" + bucket_region
+                            print("|| Proposed Log Destination bucket : "  + log_destination_bucket )
+                            bucket_tagging(s3id,tag1Key,tag1Value)
+                            if 'TargetBucket' not in str(s3temp):
+                                # Create log destination bucket if not present
+                                create_log_destination_bucket(log_destination_bucket,bucket_region,IAMReplicationRole,CentralBucketARN,CentralLogAccount,BucketObjectExpiryDays,tag1Key,tag1Value)
+
+                                # Enable bucket logging
+                                enable_bucket_logging(s3id,log_destination_bucket,bucket_region)
+
+                                # Tagging the bucket
+                                bucket_tagging(s3id,tag1Key,tag1Value)
+                            else:
+                                print("|| Logging is already enabled for " + s3id)
+                                current_log_destionation = s3temp['LoggingEnabled']['TargetBucket']
+                                print("|| The Log Destination currently set for " + s3id + " is " + current_log_destionation)
+                                if current_log_destionation == log_destination_bucket:
+                                    print ("|| Log Destionation is set properly. No action required.")
+                                    bucket_tagging(s3id,tag1Key,tag1Value)
+                                else:
+                                    print ("|| Log Destionation is NOT set to the proposed one. Further manual action required ")
+                        except Exception as e :
+                            print("exception :" + str(e))
+              Runtime: python3.8
+              InputPayload:
+                AutomationAssumeRole : '{{AutomationAssumeRole}}'
+                IAMReplicationRole : '{{IAMReplicationRole}}'
+                CentralLogAccount : '{{CentralLogAccount}}'
+                CentralBucketARN : '{{CentralBucketARN}}'
+                S3Ids: '{{S3Ids}}'
+                tag1Key: '{{tag1Key}}'
+                tag1Value: '{{tag1Value}}'
+                BucketObjectExpiryDays: '{{BucketObjectExpiryDays}}'
+                LogDestinationBucketPrefix: '{{LogDestinationBucketPrefix}}'
+              Handler: lambda_handler
+            name: EnableS3AccessLogs
+            action: 'aws:executeScript'
+            onFailure: Abort
+            timeoutSeconds: 600
+            description: |
+              ## EnableS3AccessLogs
+              Enables S3 Access logs for the target buckets.
+              ## Inputs
+              ###  * AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+              ###  * IAMReplicationRole: (Required) The ARN for the IAM role in the Member account that permits S3 to publish logs to Log Archive Account. 
+              ###  * CentralLogAccount: (Required) The Log Archive Central account number.
+              ###  * CentralBucketARN: (Required) The Central Bucket(Log Archive Account) where logs will be published to.
+              ###  * S3Ids:  (Required) A comma separated list of the S3 Bucket Name.
+              ###  * tag1Key: (Required) The Key of the Tag that will be added to the Bucket
+              ###  * tag1Value: (Required) The Value of the Tag that will be added to the Bucket
+              ###  * BucketObjectExpiryDays: (Required) The number of days the log objects will be retained in the regional log buckets.
+            isCritical: true
+            isEnd: true
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: !Sub "AWS-EnableS3AccessLogs"
+      TargetType: /
+
+  ConfigRuleForS3AccessLogsTagging:
+    DependsOn:
+    - SSMDocumentAWSEnableS3AccessLogs
+    Type: AWS::Config::ConfigRule
+    Properties: 
+      ConfigRuleName: !Ref CustomConfigRuleName
+      Description: ConfigPermissionToInvokeAnAutomaticRemediation
+      InputParameters:
+        tag1Key: !Ref tag1Key
+        tag1Value: !Ref tag1Value
+      Scope: 
+        ComplianceResourceTypes: 
+          - AWS::S3::Bucket
+      Source: 
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+
+  S3AccessLogsRemediationConfiguration:
+    DependsOn: 
+    - ConfigRuleForS3AccessLogsTagging
+    - SSMDocumentAWSEnableS3AccessLogs
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+        ConfigRuleName: !Ref CustomConfigRuleName
+        Automatic: true
+        MaximumAutomaticAttempts: 5 #minutes
+        RetryAttemptSeconds: 120 #seconds
+        ResourceType: AWS::S3::Bucket
+        Parameters:
+          S3Ids: 
+            ResourceValue:
+              Value: 'RESOURCE_ID'
+          AutomationAssumeRole:
+            StaticValue:
+              Values:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:role/${ConfigRemediationRole}"
+                  
+          IAMReplicationRole:
+            StaticValue:
+              Values:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:role/${IAMReplicationRole}"
+                  
+          CentralLogAccount:
+            StaticValue:
+              Values:
+                - !Ref CentralLogAccount
+          CentralBucketARN:
+            StaticValue:
+              Values:
+                - !Ref CentralBucketARN
+          tag1Key:
+            StaticValue:
+              Values:
+                - !Ref tag1Key
+          tag1Value:
+            StaticValue:
+              Values:
+                - !Ref tag1Value
+          BucketObjectExpiryDays:
+            StaticValue:
+              Values:
+                - !Ref BucketObjectExpiryDays
+          LogDestinationBucketPrefix:
+            StaticValue:
+              Values:
+                - !Ref LogDestinationBucketPrefix
+        TargetId: AWS-EnableS3AccessLogs
+        TargetType: SSM_DOCUMENT
+        TargetVersion: "1"
+
+Outputs:
+  ConfigRuleForS3AccessLogsTaggingArn:
+    Description: Arn of the AWS Config Rule to enable S3 Access Logs
+    Value: !GetAtt ConfigRuleForS3AccessLogsTagging.Arn
