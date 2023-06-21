@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This template will deploy the IAM roles for AWS Config rule to automatically remediate S3 Access Logs enablement'
+Resources:
+  ConfigRemediationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: SSMAutomationS3AccessLogsEnablerDoNotREMOVE
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ssm.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: SSMAutomationS3AccessLogsEnablerDoNotREMOVE
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - s3:GetBucketTagging
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketLogging
+                  - s3:PutReplicationConfiguration
+                  - s3:CreateBucket
+                  - s3:InitiateReplication
+                  - logs:PutLogEvents
+                  - s3:GetReplicationConfiguration
+                  - s3:ReplicateObject
+                  - iam:PassRole
+                  - s3:PutBucketTagging
+                  - s3:PutBucketLogging
+                  - s3:PutLifecycleConfiguration
+                  - s3:PutBucketPolicy
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetBucketLocation
+                  - s3:PutBucketVersioning
+                  - s3:ReplicateDelete
+                  - s3:ListBucket
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:*:log-stream:*
+                  - arn:aws:s3:::*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+
+  IAMReplicationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: S3ReplicationRoleDoNotREMOVE
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 's3.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: S3ReplicationRoleDoNotREMOVE
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - s3:ListBucket
+                  - s3:GetReplicationConfiguration
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                  - s3:GetObjectRetention
+                  - s3:GetObjectLegalHold
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                  - s3:ObjectOwnerOverrideToBucketOwner
+                Resource:
+                  - arn:aws:s3:::*
+                  - arn:aws:s3:::*/*
+Outputs:
+  ConfigRemediationRole:
+    Description: Arn of the IAM Role to perform auto-emediation
+    Value: !GetAtt ConfigRemediationRole.Arn
+  IAMReplicationRole:
+    Description: Arn of the IAM Role used for S3 Replication
+    Value: !GetAtt IAMReplicationRole.Arn
